@@ -1,0 +1,6 @@
+streamlit
+supabase
+pandas
+requests
+pydeck
+openai
