@@ -701,7 +701,7 @@ elif modo == "🔐 Administrador":
                 layers=[layer],
                 initial_view_state=view,
                 tooltip={"text": "{tooltip}"},
-                map_style="mapbox://styles/mapbox/light-v10",
+                map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
             ))
             st.caption(f"✅ {len(df_mapa)} de {len(df_f)} endereços no mapa.")
             st.dataframe(df_mapa[["id","classe","status","endereco","data"]].reset_index(drop=True), use_container_width=True)
