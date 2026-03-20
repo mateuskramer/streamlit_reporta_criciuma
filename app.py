@@ -543,7 +543,7 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
             st.session_state.coord_lat = None
             st.session_state.coord_lon = None
             st.success("✅ Solicitação enviada com sucesso! Acompanhe em 'Minhas Solicitações'.")
-            st.balloons()
+            
 
 # ---------------------------------------------------------------
 elif modo == "👤 Cidadão" and pagina == "📋 Minhas Solicitações":
