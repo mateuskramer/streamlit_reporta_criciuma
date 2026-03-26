@@ -9,6 +9,10 @@ import time
 from ia.gpt    import classificar_gpt
 from ia.gemini import classificar_gemini
 from ia.yolo   import detectar_buraco_yolo, classe_yolo
+from auth.login import (
+    inicializar_sessao, esta_logado, e_admin,
+    tela_login, sidebar_usuario
+)
 
 # ==============================================================
 # CONFIGURAÇÃO DA PÁGINA
@@ -31,6 +35,15 @@ def get_supabase() -> Client:
 supabase = get_supabase()
 
 # ==============================================================
+# SESSÃO E LOGIN
+# ==============================================================
+inicializar_sessao()
+
+if not esta_logado():
+    tela_login(supabase)
+    st.stop()
+
+# ==============================================================
 # GEOCODIFICAÇÃO
 # ==============================================================
 CRICIUMIA_BBOX = (-28.75, -28.60, -49.45, -49.28)
@@ -43,7 +56,6 @@ def geocodificar(endereco: str):
         api_key = st.secrets["google"]["maps_api_key"]
     except Exception:
         return None, None
-
     try:
         params = {
             "address":    f"{endereco}, Criciúma, SC, Brasil",
@@ -54,13 +66,12 @@ def geocodificar(endereco: str):
         }
         r = requests.get(
             "https://maps.googleapis.com/maps/api/geocode/json",
-            params=params,
-            timeout=10,
+            params=params, timeout=10,
         )
         data = r.json()
         status = data.get("status")
         if status != "OK" or not data.get("results"):
-            st.error(f"🗺️ Google Maps: status={status} | erro={data.get('error_message','—')}")
+            st.error(f"🗺️ Google Maps: status={status}")
             return None, None
         loc = data["results"][0]["geometry"]["location"]
         lat, lon = loc["lat"], loc["lng"]
@@ -74,7 +85,7 @@ def geocodificar(endereco: str):
         return None, None
 
 # ==============================================================
-# RUAS / BAIRROS FALLBACK
+# RUAS / BAIRROS
 # ==============================================================
 RUAS_FALLBACK = sorted([
     "Rua Cel. Pedro Benedet", "Rua Henrique Lage", "Rua Gen. Osvaldo Pinto da Veiga",
@@ -108,18 +119,13 @@ BAIRROS_FALLBACK = sorted([
 @st.cache_data(show_spinner=False, ttl=86400)
 def carregar_todas_ruas_e_bairros():
     import urllib.parse
-
     termos = [
         "rua", "avenida", "travessa", "estrada", "rodovia",
         "alameda", "linha", "servidão", "vila", "beco",
         "largo", "praça", "loteamento", "parque"
     ]
-
-    ruas_set    = set()
-    bairros_set = set()
-    rua_p_bairro  = {}
-    bairro_p_rua  = {}
-
+    ruas_set, bairros_set = set(), set()
+    rua_p_bairro, bairro_p_rua = {}, {}
     for termo in termos:
         try:
             url = (
@@ -127,36 +133,28 @@ def carregar_todas_ruas_e_bairros():
                 f"{urllib.parse.quote(termo)}/json/"
             )
             r = requests.get(url, timeout=10)
-            if r.status_code != 200:
-                continue
+            if r.status_code != 200: continue
             data = r.json()
-            if not isinstance(data, list):
-                continue
+            if not isinstance(data, list): continue
             for item in data:
                 logradouro = item.get("logradouro", "").strip()
                 bairro     = item.get("bairro", "").strip()
-                if logradouro:
-                    ruas_set.add(logradouro)
-                if bairro:
-                    bairros_set.add(bairro)
+                if logradouro: ruas_set.add(logradouro)
+                if bairro:     bairros_set.add(bairro)
                 if logradouro and bairro:
                     rua_p_bairro.setdefault(logradouro, set()).add(bairro)
                     bairro_p_rua.setdefault(bairro, set()).add(logradouro)
             time.sleep(0.1)
         except Exception:
             continue
-
     ruas_set    |= set(RUAS_FALLBACK)
     bairros_set |= set(BAIRROS_FALLBACK)
+    return (
+        sorted(ruas_set), sorted(bairros_set),
+        {k: sorted(v) for k, v in rua_p_bairro.items()},
+        {k: sorted(v) for k, v in bairro_p_rua.items()},
+    )
 
-    rua_p_bairro_sorted  = {k: sorted(v) for k, v in rua_p_bairro.items()}
-    bairro_p_rua_sorted  = {k: sorted(v) for k, v in bairro_p_rua.items()}
-
-    return sorted(ruas_set), sorted(bairros_set), rua_p_bairro_sorted, bairro_p_rua_sorted
-
-# ==============================================================
-# CATEGORIAS
-# ==============================================================
 CATEGORIAS_SUGERIDAS = ["Buraco", "Lixo", "Barulho", "Lâmpada Apagada", "Outro"]
 
 # ==============================================================
@@ -166,29 +164,30 @@ st.sidebar.image("https://img.icons8.com/fluency/96/city-buildings.png", width=8
 st.sidebar.title("Reporta Criciúma")
 st.sidebar.markdown("---")
 
-modo = st.sidebar.radio("Modo", ["👤 Cidadão", "🔐 Administrador"], index=0)
+# Info do usuário + logout
+sidebar_usuario(supabase)
+st.sidebar.markdown("---")
 
-if modo == "👤 Cidadão":
-    st.sidebar.markdown("---")
-    pagina = st.sidebar.radio(
-        "Navegação",
-        ["🆕 Nova Solicitação", "📋 Minhas Solicitações", "📊 Dashboard"]
-    )
-else:
-    st.sidebar.markdown("---")
+# Navegação baseada no role
+if e_admin():
     pagina = st.sidebar.radio(
         "Painel Admin",
         ["📍 Mapa", "📋 Demandas", "📊 Análise"]
     )
+else:
+    pagina = st.sidebar.radio(
+        "Navegação",
+        ["🆕 Nova Solicitação", "📋 Minhas Solicitações", "📊 Dashboard"]
+    )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Reporta Criciúma v1.5 — Criciúma, SC")
+st.sidebar.caption("Reporta Criciúma v1.6 — Criciúma, SC")
 
 # ██████████████████████████████████████████████████████████████
 #  CIDADÃO — NOVA SOLICITAÇÃO
 # ██████████████████████████████████████████████████████████████
 
-if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
+if not e_admin() and pagina == "🆕 Nova Solicitação":
     st.header("📍 Reportar Problema")
     st.write("Descreva o problema e informe o local. Nossa equipe cuida do resto!")
 
@@ -203,7 +202,6 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
     with st.spinner("🔄 Carregando logradouros de Criciúma..."):
         todas_ruas, todos_bairros, rua_p_bairro, bairro_p_rua = carregar_todas_ruas_e_bairros()
 
-    # ---------- Anexo ----------
     st.subheader("📎 Foto, Vídeo ou Áudio (opcional)")
     aba_upload, aba_camera = st.tabs(["📁 Fazer upload", "📷 Tirar foto agora"])
 
@@ -217,12 +215,9 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
         if arquivo_upload is not None:
             arquivo = arquivo_upload
             tipo = arquivo.type
-            if tipo.startswith("image/"):
-                st.image(arquivo, use_column_width=True); arquivo.seek(0)
-            elif tipo.startswith("video/"):
-                st.video(arquivo); arquivo.seek(0)
-            elif tipo.startswith("audio/"):
-                st.audio(arquivo); arquivo.seek(0)
+            if tipo.startswith("image/"):   st.image(arquivo, use_column_width=True); arquivo.seek(0)
+            elif tipo.startswith("video/"): st.video(arquivo); arquivo.seek(0)
+            elif tipo.startswith("audio/"): st.audio(arquivo); arquivo.seek(0)
 
     with aba_camera:
         foto_camera = st.camera_input("Tire uma foto do problema")
@@ -238,7 +233,7 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
 
     if bairro_ativo and bairro_ativo in bairro_p_rua:
         ruas_disponiveis = [""] + sorted(bairro_p_rua[bairro_ativo])
-        hint_rua = f"Mostrando {len(ruas_disponiveis)-1} ruas do bairro {bairro_ativo}."
+        hint_rua = f"Mostrando ruas do bairro {bairro_ativo}."
     else:
         ruas_disponiveis = [""] + todas_ruas
         hint_rua = f"{len(todas_ruas)} logradouros disponíveis."
@@ -261,11 +256,8 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
     col_rua, col_num = st.columns([5, 1])
     with col_rua:
         rua_selecionada = st.selectbox(
-            "🏠 Rua / Avenida",
-            options=ruas_disponiveis,
-            index=idx_rua,
-            placeholder="Digite para filtrar...",
-            help=hint_rua
+            "🏠 Rua / Avenida", options=ruas_disponiveis,
+            index=idx_rua, placeholder="Digite para filtrar...", help=hint_rua
         )
         if rua_selecionada != st.session_state.rua_sel:
             st.session_state.rua_sel = rua_selecionada
@@ -281,11 +273,8 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
         st.session_state.numero = numero
 
     bairro_selecionado = st.selectbox(
-        "🏘️ Bairro",
-        options=bairros_disponiveis,
-        index=idx_bairro,
-        placeholder="Digite para filtrar...",
-        help=hint_bairro
+        "🏘️ Bairro", options=bairros_disponiveis,
+        index=idx_bairro, placeholder="Digite para filtrar...", help=hint_bairro
     )
     if bairro_selecionado != st.session_state.bairro_sel:
         st.session_state.bairro_sel = bairro_selecionado
@@ -303,8 +292,7 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
             if bairro_selecionado:
                 tentativas.append(f"{rua_selecionada}, {bairro_selecionado}")
             tentativas.append(rua_selecionada)
-            if bairro_selecionado:
-                tentativas.append(bairro_selecionado)
+            if bairro_selecionado: tentativas.append(bairro_selecionado)
             tentativas.append("Criciúma, SC")
 
             lat, lon, usou = None, None, ""
@@ -353,7 +341,6 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
     classe_cidadao = st.selectbox(
         "🏷️ Qual o tipo de problema?",
         options=CATEGORIAS_SUGERIDAS,
-        help="Escolha a categoria que melhor descreve o problema."
     )
 
     st.markdown("")
@@ -369,7 +356,6 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
             endereco_completo = ", ".join(partes)
 
             with st.spinner("Enviando sua solicitação..."):
-                # 1. Upload do arquivo
                 url_do_arquivo = None
                 tipo_arquivo_salvo = None
                 if arquivo is not None:
@@ -383,14 +369,12 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
                     tipo_arquivo_salvo = arquivo.type
                     arquivo.seek(0)
 
-                # 2. Classificação pelas três IAs (independentes)
                 with st.spinner("Analisando com IA..."):
-                    classe_gpt    = classificar_gpt(descricao, arquivo, tipo_arquivo_salvo or "")
-                    classe_gemini = classificar_gemini(descricao, arquivo, tipo_arquivo_salvo or "")
+                    classe_gpt     = classificar_gpt(descricao, arquivo, tipo_arquivo_salvo or "")
+                    classe_gemini  = classificar_gemini(descricao, arquivo, tipo_arquivo_salvo or "")
                     resultado_yolo = detectar_buraco_yolo(arquivo, tipo_arquivo_salvo or "")
                     classe_yolo_str = classe_yolo(resultado_yolo)
 
-                # 3. Salva no Supabase
                 supabase.table("solicitacoes").insert({
                     "data":           datetime.now().strftime("%d/%m/%Y %H:%M"),
                     "classe":         classe_cidadao,
@@ -405,6 +389,7 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
                     "tipo_arquivo":   tipo_arquivo_salvo,
                     "lat":            st.session_state.coord_lat,
                     "lon":            st.session_state.coord_lon,
+                    "usuario_id":     st.session_state.usuario_id,
                 }).execute()
 
             for k in ["rua_sel", "bairro_sel", "numero", "descricao"]:
@@ -414,13 +399,21 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
             st.success("✅ Solicitação enviada! Acompanhe em 'Minhas Solicitações'.")
 
 # ---------------------------------------------------------------
-elif modo == "👤 Cidadão" and pagina == "📋 Minhas Solicitações":
-    st.header("📋 Acompanhamento de Solicitações")
+elif not e_admin() and pagina == "📋 Minhas Solicitações":
+    st.header("📋 Minhas Solicitações")
     with st.spinner("Carregando..."):
-        dados = supabase.table("solicitacoes").select("*").order("id", desc=True).execute().data
+        # Filtra só as solicitações do usuário logado
+        dados = (
+            supabase.table("solicitacoes")
+            .select("*")
+            .eq("usuario_id", st.session_state.usuario_id)
+            .order("id", desc=True)
+            .execute()
+            .data
+        )
 
     if not dados:
-        st.info("Nenhuma solicitação ainda. Envie sua primeira demanda!")
+        st.info("Você ainda não enviou nenhuma solicitação.")
     else:
         for item in dados:
             s = item.get("status", "")
@@ -447,7 +440,7 @@ elif modo == "👤 Cidadão" and pagina == "📋 Minhas Solicitações":
                         else: st.markdown(f"[📎 Ver anexo]({url})")
 
 # ---------------------------------------------------------------
-elif modo == "👤 Cidadão" and pagina == "📊 Dashboard":
+elif not e_admin() and pagina == "📊 Dashboard":
     st.header("📊 Impacto na Cidade")
     dados = supabase.table("solicitacoes").select("*").execute().data
     if dados:
@@ -469,7 +462,7 @@ elif modo == "👤 Cidadão" and pagina == "📊 Dashboard":
 #  ADMIN
 # ██████████████████████████████████████████████████████████████
 
-elif modo == "🔐 Administrador":
+elif e_admin():
     with st.spinner("Carregando ocorrências..."):
         df_raw = supabase.table("solicitacoes").select("*").order("id", desc=True).execute().data
 
@@ -482,9 +475,9 @@ elif modo == "🔐 Administrador":
     st.title("🗺️ Painel de Gestão — Reporta Criciúma")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total", len(df))
-    m2.metric("Pendentes",     len(df[df["status"].str.contains("Pendente",  na=False)]))
-    m3.metric("Em Andamento",  len(df[df["status"].str.contains("andamento", case=False, na=False)]))
-    m4.metric("Resolvidas",    len(df[df["status"].str.contains("Resolvido", na=False)]))
+    m2.metric("Pendentes",    len(df[df["status"].str.contains("Pendente",  na=False)]))
+    m3.metric("Em Andamento", len(df[df["status"].str.contains("andamento", case=False, na=False)]))
+    m4.metric("Resolvidas",   len(df[df["status"].str.contains("Resolvido", na=False)]))
     st.markdown("---")
 
     TODOS_STATUS = ["Todos", "🔴 Pendente", "🟡 Em andamento", "🟢 Resolvido"]
@@ -506,10 +499,8 @@ elif modo == "🔐 Administrador":
         "🟢 Resolvido":    [34,  197, 94],
     }
 
-    # ----------------------------------------------------------
     if pagina == "📍 Mapa":
         st.subheader("📍 Mapa de Ocorrências")
-
         col_leg = st.columns(3)
         for i, (status, cor) in enumerate(COR_STATUS.items()):
             hex_cor = "#{:02x}{:02x}{:02x}".format(*cor)
@@ -540,17 +531,13 @@ elif modo == "🔐 Administrador":
                 lambda r: r["classe"] + " — " + r["status"] + "\n" + r["endereco"], axis=1
             )
             layer = pdk.Layer(
-                "ScatterplotLayer",
-                data=df_mapa,
-                get_position=["lon", "lat"],
-                get_fill_color="cor",
-                get_radius=60,
-                pickable=True,
+                "ScatterplotLayer", data=df_mapa,
+                get_position=["lon", "lat"], get_fill_color="cor",
+                get_radius=60, pickable=True,
             )
             view = pdk.ViewState(latitude=CRICIUMIA_LAT, longitude=CRICIUMIA_LON, zoom=13)
             st.pydeck_chart(pdk.Deck(
-                layers=[layer],
-                initial_view_state=view,
+                layers=[layer], initial_view_state=view,
                 tooltip={"text": "{tooltip}"},
                 map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
             ))
@@ -562,10 +549,8 @@ elif modo == "🔐 Administrador":
         else:
             st.warning("Nenhum endereço geolocalizado para os filtros selecionados.")
 
-    # ----------------------------------------------------------
     elif pagina == "📋 Demandas":
         st.subheader(f"📋 Demandas ({len(df_f)} encontradas)")
-
         for _, row in df_f.iterrows():
             s = str(row.get("status", ""))
             icon = "🔴" if "Pendente" in s else "🟡" if "andamento" in s.lower() else "🟢"
@@ -587,11 +572,8 @@ elif modo == "🔐 Administrador":
                 with col_info:
                     st.write(f"**📌 Endereço:** {row.get('endereco','')}")
                     st.write(f"**📝 Descrição:** {row.get('descricao','') or '—'}")
-
-                    # Quatro colunas de classificação
                     cc1, cc2, cc3, cc4 = st.columns(4)
-                    with cc1:
-                        st.info(f"**👤 Cidadão**\n{classe_cid}")
+                    with cc1: st.info(f"**👤 Cidadão**\n{classe_cid}")
                     with cc2:
                         fn = st.success if classe_gpt == classe_cid else (st.warning if "Erro" in classe_gpt else st.info)
                         fn(f"**🤖 GPT**\n{classe_gpt}")
@@ -599,14 +581,11 @@ elif modo == "🔐 Administrador":
                         fn = st.success if classe_gemini == classe_cid else (st.warning if "Erro" in classe_gemini else st.info)
                         fn(f"**✨ Gemini**\n{classe_gemini}")
                     with cc4:
-                        # YOLO: verde se detectou buraco E cidadão disse buraco, cinza se "—"
-                        if classe_yolo_v == "—":
-                            st.info(f"**🔍 YOLO**\n{classe_yolo_v}")
+                        if classe_yolo_v == "—": st.info(f"**🔍 YOLO**\n{classe_yolo_v}")
                         elif "Buraco" in classe_yolo_v:
                             fn = st.success if classe_cid == "Buraco" else st.warning
                             fn(f"**🔍 YOLO**\n{classe_yolo_v}")
-                        else:
-                            st.info(f"**🔍 YOLO**\n{classe_yolo_v}")
+                        else: st.info(f"**🔍 YOLO**\n{classe_yolo_v}")
 
                 with col_midia:
                     url = row.get("url_arquivo"); tipo = str(row.get("tipo_arquivo", ""))
@@ -625,9 +604,7 @@ elif modo == "🔐 Administrador":
                 with c1:
                     novo_status = st.selectbox("Status", opcoes_status, index=idx_s, key=f"st_{row['id']}")
                 with c2:
-                    nova_resp = st.text_input(
-                        "Resposta da Prefeitura", value=row.get("resposta", ""), key=f"rp_{row['id']}"
-                    )
+                    nova_resp = st.text_input("Resposta da Prefeitura", value=row.get("resposta", ""), key=f"rp_{row['id']}")
 
                 resp_url_atual  = row.get("resp_url_arquivo")
                 resp_tipo_atual = str(row.get("resp_tipo_arquivo", ""))
@@ -658,7 +635,6 @@ elif modo == "🔐 Administrador":
                     st.success("✅ Atualizado!")
                     st.rerun()
 
-    # ----------------------------------------------------------
     elif pagina == "📊 Análise":
         st.subheader("📊 Análise Geral")
         g1, g2 = st.columns(2)
