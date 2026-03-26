@@ -5,8 +5,10 @@ from supabase import create_client, Client
 import uuid
 import requests
 import time
-import base64
-import json
+
+from ia.gpt    import classificar_gpt
+from ia.gemini import classificar_gemini
+from ia.yolo   import detectar_buraco_yolo, classe_yolo
 
 # ==============================================================
 # CONFIGURAÇÃO DA PÁGINA
@@ -44,10 +46,10 @@ def geocodificar(endereco: str):
 
     try:
         params = {
-            "address":  f"{endereco}, Criciúma, SC, Brasil",
-            "key":      api_key,
-            "language": "pt-BR",
-            "region":   "BR",
+            "address":    f"{endereco}, Criciúma, SC, Brasil",
+            "key":        api_key,
+            "language":   "pt-BR",
+            "region":     "BR",
             "components": "country:BR|administrative_area:SC",
         }
         r = requests.get(
@@ -72,7 +74,7 @@ def geocodificar(endereco: str):
         return None, None
 
 # ==============================================================
-# RUAS FALLBACK — usadas se a ViaCEP não retornar dados suficientes
+# RUAS / BAIRROS FALLBACK
 # ==============================================================
 RUAS_FALLBACK = sorted([
     "Rua Cel. Pedro Benedet", "Rua Henrique Lage", "Rua Gen. Osvaldo Pinto da Veiga",
@@ -103,20 +105,8 @@ BAIRROS_FALLBACK = sorted([
     "São Francisco", "Tereza Cristina", "Jardim Maristela",
 ])
 
-# ==============================================================
-# PRÉ-CARREGA TODAS AS RUAS E BAIRROS DE CRICIÚMA (ViaCEP)
-# Executa uma vez e fica em cache por 24h.
-# Retorna: (ruas_sorted, bairros_sorted, rua_para_bairros, bairro_para_ruas)
-# ==============================================================
 @st.cache_data(show_spinner=False, ttl=86400)
 def carregar_todas_ruas_e_bairros():
-    """
-    Varre termos genéricos na ViaCEP e monta:
-      - lista de ruas
-      - lista de bairros
-      - dict rua  → set de bairros (para filtrar bairro ao escolher rua)
-      - dict bairro → set de ruas  (para filtrar rua ao escolher bairro)
-    """
     import urllib.parse
 
     termos = [
@@ -127,8 +117,8 @@ def carregar_todas_ruas_e_bairros():
 
     ruas_set    = set()
     bairros_set = set()
-    rua_p_bairro  = {}   # rua  → {bairro, ...}
-    bairro_p_rua  = {}   # bairro → {rua, ...}
+    rua_p_bairro  = {}
+    bairro_p_rua  = {}
 
     for termo in termos:
         try:
@@ -149,7 +139,6 @@ def carregar_todas_ruas_e_bairros():
                     ruas_set.add(logradouro)
                 if bairro:
                     bairros_set.add(bairro)
-                # Monta os índices cruzados
                 if logradouro and bairro:
                     rua_p_bairro.setdefault(logradouro, set()).add(bairro)
                     bairro_p_rua.setdefault(bairro, set()).add(logradouro)
@@ -157,119 +146,21 @@ def carregar_todas_ruas_e_bairros():
         except Exception:
             continue
 
-    # Mescla fallback (sem relacionamento cruzado — bairros genéricos)
     ruas_set    |= set(RUAS_FALLBACK)
     bairros_set |= set(BAIRROS_FALLBACK)
 
-    # Converte sets para listas ordenadas nos dicts (para ser serializável pelo cache)
     rua_p_bairro_sorted  = {k: sorted(v) for k, v in rua_p_bairro.items()}
     bairro_p_rua_sorted  = {k: sorted(v) for k, v in bairro_p_rua.items()}
 
     return sorted(ruas_set), sorted(bairros_set), rua_p_bairro_sorted, bairro_p_rua_sorted
 
-
 # ==============================================================
-# CLASSIFICAÇÃO POR IA — GPT-4o-mini + Gemini (piloto comparativo)
+# CATEGORIAS
 # ==============================================================
 CATEGORIAS_SUGERIDAS = ["Buraco", "Lixo", "Barulho", "Lâmpada Apagada", "Outro"]
 
-PROMPT_IA = (
-    "Você é um assistente de gestão urbana da prefeitura de Criciúma, SC. "
-    "Analise a descrição e/ou imagem enviada pelo cidadão e classifique o problema. "
-    "Prefira uma dessas categorias: Buraco, Lixo, Barulho, Lâmpada Apagada. "
-    "Se não se encaixar bem em nenhuma, use uma categoria curta e descritiva (ex: Calçada, Esgoto, Pichação). "
-    'Responda APENAS com JSON: {"classe": "categoria_aqui"}'
-)
-
-def _parse_classe(texto: str) -> str:
-    texto = texto.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(texto).get("classe", "Outro") or "Outro"
-
-def classificar_gpt(descricao: str = "", arquivo=None, tipo_arquivo: str = "") -> str:
-    try:
-        api_key = st.secrets["openai"]["api_key"]
-    except Exception:
-        return "Erro (sem chave)"
-
-    prompt_full = PROMPT_IA + f" Descrição: {descricao if descricao else '(não fornecida)'}"
-    content_parts = [{"type": "text", "text": prompt_full}]
-    if arquivo is not None and tipo_arquivo in ["image/png", "image/jpeg", "image/jpg", "image/webp"]:
-        arquivo.seek(0)
-        img_b64 = base64.b64encode(arquivo.read()).decode("utf-8")
-        content_parts.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{tipo_arquivo};base64,{img_b64}", "detail": "low"}
-        })
-        arquivo.seek(0)
-
-    try:
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": content_parts}],
-                "max_tokens": 50,
-                "temperature": 0.1,
-            },
-            timeout=15,
-        )
-        r.raise_for_status()
-        return _parse_classe(r.json()["choices"][0]["message"]["content"])
-    except requests.exceptions.Timeout:
-        return "Erro GPT: timeout"
-    except requests.exceptions.HTTPError as e:
-        codigo = e.response.status_code if e.response is not None else "?"
-        return f"Erro GPT: HTTP {codigo}"
-    except Exception as e:
-        return f"Erro GPT: {str(e)[:40]}"
-
-def classificar_gemini(descricao: str = "", arquivo=None, tipo_arquivo: str = "") -> str:
-    try:
-        api_key = st.secrets["gemini"]["api_key"]
-    except Exception:
-        return "Erro (sem chave)"
-
-    prompt_full = PROMPT_IA + f" Descrição: {descricao if descricao else '(não fornecida)'}"
-    parts = [{"text": prompt_full}]
-    if arquivo is not None and tipo_arquivo in ["image/png", "image/jpeg", "image/jpg", "image/webp"]:
-        arquivo.seek(0)
-        parts.append({"inline_data": {
-            "mime_type": tipo_arquivo,
-            "data": base64.b64encode(arquivo.read()).decode("utf-8")
-        }})
-        arquivo.seek(0)
-
-    payload = {
-        "contents": [{"parts": parts}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 50}
-    }
-
-    ultimo_erro = "desconhecido"
-    for modelo in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"]:
-        try:
-            r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={api_key}",
-                json=payload, timeout=15
-            )
-            if r.status_code == 429:
-                ultimo_erro = "rate limit (429)"
-                time.sleep(2)
-                continue
-            if not r.ok:
-                ultimo_erro = f"HTTP {r.status_code}"
-                continue
-            return _parse_classe(r.json()["candidates"][0]["content"]["parts"][0]["text"])
-        except requests.exceptions.Timeout:
-            ultimo_erro = "timeout"
-            continue
-        except Exception as e:
-            ultimo_erro = str(e)[:40]
-            continue
-    return f"Erro Gemini: {ultimo_erro}"
-
 # ==============================================================
-# SIDEBAR — SWITCH CIDADÃO / ADMIN
+# SIDEBAR
 # ==============================================================
 st.sidebar.image("https://img.icons8.com/fluency/96/city-buildings.png", width=80)
 st.sidebar.title("Reporta Criciúma")
@@ -277,13 +168,6 @@ st.sidebar.markdown("---")
 
 modo = st.sidebar.radio("Modo", ["👤 Cidadão", "🔐 Administrador"], index=0)
 
-# ==============================================================
-# AUTENTICAÇÃO DO ADMIN — desativada temporariamente
-# ==============================================================
-
-# ==============================================================
-# NAVEGAÇÃO
-# ==============================================================
 if modo == "👤 Cidadão":
     st.sidebar.markdown("---")
     pagina = st.sidebar.radio(
@@ -298,17 +182,16 @@ else:
     )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Reporta Criciúma v1.4 — Criciúma, SC")
+st.sidebar.caption("Reporta Criciúma v1.5 — Criciúma, SC")
 
 # ██████████████████████████████████████████████████████████████
-#  ÁREA DO CIDADÃO — NOVA SOLICITAÇÃO
+#  CIDADÃO — NOVA SOLICITAÇÃO
 # ██████████████████████████████████████████████████████████████
 
 if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
     st.header("📍 Reportar Problema")
     st.write("Descreva o problema e informe o local. Nossa equipe cuida do resto!")
 
-    # Inicializa session_state
     defaults = {
         "rua_sel": "", "numero": "", "bairro_sel": "",
         "descricao": "", "coord_lat": None, "coord_lon": None
@@ -317,13 +200,11 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
         if k not in st.session_state:
             st.session_state[k] = v
 
-    # ---- Pré-carrega ruas, bairros e índices cruzados ----
     with st.spinner("🔄 Carregando logradouros de Criciúma..."):
         todas_ruas, todos_bairros, rua_p_bairro, bairro_p_rua = carregar_todas_ruas_e_bairros()
 
     # ---------- Anexo ----------
     st.subheader("📎 Foto, Vídeo ou Áudio (opcional)")
-
     aba_upload, aba_camera = st.tabs(["📁 Fazer upload", "📷 Tirar foto agora"])
 
     arquivo = None
@@ -346,42 +227,37 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
     with aba_camera:
         foto_camera = st.camera_input("Tire uma foto do problema")
         if foto_camera is not None:
-            arquivo = foto_camera  # camera_input já retorna um objeto compatível com file_uploader
+            arquivo = foto_camera
             st.image(foto_camera, use_column_width=True)
 
     st.markdown("---")
     st.subheader("📌 Localização do Problema")
 
-    # ---- Monta lista de ruas filtrada pelo bairro já selecionado (e vice-versa) ----
     bairro_ativo = st.session_state.bairro_sel
     rua_ativa    = st.session_state.rua_sel
 
     if bairro_ativo and bairro_ativo in bairro_p_rua:
-        # Bairro escolhido primeiro → mostra só as ruas daquele bairro
         ruas_disponiveis = [""] + sorted(bairro_p_rua[bairro_ativo])
-        hint_rua = f"Mostrando {len(ruas_disponiveis)-1} ruas do bairro {bairro_ativo}. Limpe o bairro para ver todas."
+        hint_rua = f"Mostrando {len(ruas_disponiveis)-1} ruas do bairro {bairro_ativo}."
     else:
         ruas_disponiveis = [""] + todas_ruas
-        hint_rua = f"{len(todas_ruas)} logradouros disponíveis. Escolha o bairro primeiro para filtrar."
+        hint_rua = f"{len(todas_ruas)} logradouros disponíveis."
 
     if rua_ativa and rua_ativa in rua_p_bairro:
-        # Rua escolhida primeiro → mostra só os bairros daquela rua
         bairros_disponiveis = [""] + sorted(rua_p_bairro[rua_ativa])
-        hint_bairro = f"Bairro(s) compatível(is) com a rua selecionada."
+        hint_bairro = "Bairro(s) compatível(is) com a rua selecionada."
     else:
         bairros_disponiveis = [""] + todos_bairros
         hint_bairro = f"{len(todos_bairros)} bairros disponíveis."
 
-    # Garante que o valor atual está na lista (pode vir do CEP)
     if rua_ativa and rua_ativa not in ruas_disponiveis:
         ruas_disponiveis = ["", rua_ativa] + ruas_disponiveis[1:]
     if bairro_ativo and bairro_ativo not in bairros_disponiveis:
         bairros_disponiveis = ["", bairro_ativo] + bairros_disponiveis[1:]
 
-    idx_rua    = ruas_disponiveis.index(rua_ativa)    if rua_ativa    in ruas_disponiveis    else 0
+    idx_rua    = ruas_disponiveis.index(rua_ativa)       if rua_ativa    in ruas_disponiveis    else 0
     idx_bairro = bairros_disponiveis.index(bairro_ativo) if bairro_ativo in bairros_disponiveis else 0
 
-    # ---- Rua + Número na mesma linha ----
     col_rua, col_num = st.columns([5, 1])
     with col_rua:
         rua_selecionada = st.selectbox(
@@ -391,10 +267,8 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
             placeholder="Digite para filtrar...",
             help=hint_rua
         )
-        # Atualiza estado e filtra bairro automaticamente
         if rua_selecionada != st.session_state.rua_sel:
             st.session_state.rua_sel = rua_selecionada
-            # Se só um bairro possível, preenche automaticamente
             if rua_selecionada and rua_selecionada in rua_p_bairro:
                 bairros_da_rua = rua_p_bairro[rua_selecionada]
                 if len(bairros_da_rua) == 1:
@@ -406,7 +280,6 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
         numero = st.text_input("Nº", value=st.session_state.numero, placeholder="123")
         st.session_state.numero = numero
 
-    # ---- Bairro ----
     bairro_selecionado = st.selectbox(
         "🏘️ Bairro",
         options=bairros_disponiveis,
@@ -414,21 +287,16 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
         placeholder="Digite para filtrar...",
         help=hint_bairro
     )
-    # Atualiza estado e filtra ruas automaticamente
     if bairro_selecionado != st.session_state.bairro_sel:
         st.session_state.bairro_sel = bairro_selecionado
         if not bairro_selecionado:
             st.session_state.rua_sel = ""
         st.rerun()
 
-
-
-    # ---- Verificar no mapa ----
     if st.button("🗺️ Verificar localização no mapa"):
         if not rua_selecionada:
             st.warning("⚠️ Selecione a rua antes de continuar.")
         else:
-            # Cascata de tentativas: mais específico → mais genérico
             tentativas = []
             if numero and bairro_selecionado:
                 tentativas.append(f"{rua_selecionada}, {numero}, {bairro_selecionado}")
@@ -436,8 +304,8 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
                 tentativas.append(f"{rua_selecionada}, {bairro_selecionado}")
             tentativas.append(rua_selecionada)
             if bairro_selecionado:
-                tentativas.append(bairro_selecionado)   # fallback: centraliza no bairro
-            tentativas.append("Criciúma, SC")            # último recurso
+                tentativas.append(bairro_selecionado)
+            tentativas.append("Criciúma, SC")
 
             lat, lon, usou = None, None, ""
             with st.spinner("Verificando localização..."):
@@ -450,13 +318,12 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
             if lat and lon:
                 st.session_state.coord_lat = lat
                 st.session_state.coord_lon = lon
-                # Avisa o usuário se usou um endereço menos preciso
                 if usou == rua_selecionada:
-                    st.warning("📍 Localização aproximada — endereço encontrado, mas sem número exato.")
+                    st.warning("📍 Localização aproximada — sem número exato.")
                 elif usou == bairro_selecionado:
-                    st.warning("📍 Localização aproximada — rua não encontrada, centralizando no bairro.")
+                    st.warning("📍 Localização aproximada — centralizando no bairro.")
                 elif usou == "Criciúma, SC":
-                    st.warning("📍 Não foi possível localizar o endereço. Pin centralizado em Criciúma.")
+                    st.warning("📍 Endereço não encontrado. Pin centralizado em Criciúma.")
                 else:
                     st.success("✅ Localização confirmada!")
             else:
@@ -475,23 +342,20 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
         )
         st.caption("📍 Confirme se o pin está no local correto.")
 
-    # ---- Descrição ----
     st.markdown("---")
     descricao = st.text_area(
         "📝 Descrição (opcional, mas ajuda!)",
         value=st.session_state.descricao,
-        placeholder="Ex: Buraco grande na pista próximo à padaria, causando risco para motoristas..."
+        placeholder="Ex: Buraco grande na pista próximo à padaria..."
     )
     st.session_state.descricao = descricao
 
-    # ---- Classificação do cidadão ----
     classe_cidadao = st.selectbox(
         "🏷️ Qual o tipo de problema?",
         options=CATEGORIAS_SUGERIDAS,
         help="Escolha a categoria que melhor descreve o problema."
     )
 
-    # ---- Enviar ----
     st.markdown("")
     if st.button("📤 Enviar Demanda", type="primary"):
         if not rua_selecionada:
@@ -506,27 +370,33 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
 
             with st.spinner("Enviando sua solicitação..."):
                 # 1. Upload do arquivo
-                url_do_arquivo = None; tipo_arquivo_salvo = None
+                url_do_arquivo = None
+                tipo_arquivo_salvo = None
                 if arquivo is not None:
                     ext  = arquivo.name.split(".")[-1]
                     nome = f"{uuid.uuid4()}.{ext}"
                     arquivo.seek(0)
-                    supabase.storage.from_("anexos").upload(nome, arquivo.read(), {"content-type": arquivo.type})
+                    supabase.storage.from_("anexos").upload(
+                        nome, arquivo.read(), {"content-type": arquivo.type}
+                    )
                     url_do_arquivo     = supabase.storage.from_("anexos").get_public_url(nome)
                     tipo_arquivo_salvo = arquivo.type
                     arquivo.seek(0)
 
-                # 2. Ambas as IAs classificam
-                with st.spinner("Analisando problema com IA..."):
+                # 2. Classificação pelas três IAs (independentes)
+                with st.spinner("Analisando com IA..."):
                     classe_gpt    = classificar_gpt(descricao, arquivo, tipo_arquivo_salvo or "")
                     classe_gemini = classificar_gemini(descricao, arquivo, tipo_arquivo_salvo or "")
+                    resultado_yolo = detectar_buraco_yolo(arquivo, tipo_arquivo_salvo or "")
+                    classe_yolo_str = classe_yolo(resultado_yolo)
 
-                # 3. Salva no Supabase (inclui lat/lon já conhecidos do cidadão)
+                # 3. Salva no Supabase
                 supabase.table("solicitacoes").insert({
                     "data":           datetime.now().strftime("%d/%m/%Y %H:%M"),
                     "classe":         classe_cidadao,
                     "classe_ia":      classe_gpt,
                     "classe_gemini":  classe_gemini,
+                    "classe_yolo":    classe_yolo_str,
                     "endereco":       endereco_completo,
                     "descricao":      descricao,
                     "status":         "🔴 Pendente",
@@ -537,13 +407,11 @@ if modo == "👤 Cidadão" and pagina == "🆕 Nova Solicitação":
                     "lon":            st.session_state.coord_lon,
                 }).execute()
 
-            # Reset
             for k in ["rua_sel", "bairro_sel", "numero", "descricao"]:
                 st.session_state[k] = ""
             st.session_state.coord_lat = None
             st.session_state.coord_lon = None
-            st.success("✅ Solicitação enviada com sucesso! Acompanhe em 'Minhas Solicitações'.")
-            
+            st.success("✅ Solicitação enviada! Acompanhe em 'Minhas Solicitações'.")
 
 # ---------------------------------------------------------------
 elif modo == "👤 Cidadão" and pagina == "📋 Minhas Solicitações":
@@ -563,16 +431,15 @@ elif modo == "👤 Cidadão" and pagina == "📋 Minhas Solicitações":
                     st.write(f"**📌 Endereço:** {item.get('endereco','')}")
                     st.write(f"**📝 Descrição:** {item.get('descricao','') or '—'}")
                     st.info(f"**💬 Resposta da Prefeitura:** {item.get('resposta','')}")
-                    # Mídia anexada pelo admin na resposta
                     resp_url  = item.get("resp_url_arquivo")
-                    resp_tipo = str(item.get("resp_tipo_arquivo",""))
+                    resp_tipo = str(item.get("resp_tipo_arquivo", ""))
                     if resp_url:
                         st.caption("📎 Arquivo enviado pela Prefeitura:")
                         if resp_tipo.startswith("image/"): st.image(resp_url)
                         elif resp_tipo.startswith("video/"): st.video(resp_url)
                         else: st.markdown(f"[📎 Ver arquivo]({resp_url})")
                 with col_b:
-                    url = item.get("url_arquivo"); tipo = item.get("tipo_arquivo","")
+                    url = item.get("url_arquivo"); tipo = item.get("tipo_arquivo", "")
                     if url:
                         if str(tipo).startswith("image/"): st.image(url)
                         elif str(tipo).startswith("video/"): st.video(url)
@@ -599,7 +466,7 @@ elif modo == "👤 Cidadão" and pagina == "📊 Dashboard":
         st.warning("Sem dados ainda.")
 
 # ██████████████████████████████████████████████████████████████
-#  ÁREA DO ADMIN
+#  ADMIN
 # ██████████████████████████████████████████████████████████████
 
 elif modo == "🔐 Administrador":
@@ -615,16 +482,13 @@ elif modo == "🔐 Administrador":
     st.title("🗺️ Painel de Gestão — Reporta Criciúma")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total", len(df))
-    m2.metric("Pendentes", len(df[df["status"].str.contains("Pendente", na=False)]))
-    m3.metric("Em Andamento", len(df[df["status"].str.contains("andamento", case=False, na=False)]))
-    m4.metric("Resolvidas", len(df[df["status"].str.contains("Resolvido", na=False)]))
+    m2.metric("Pendentes",     len(df[df["status"].str.contains("Pendente",  na=False)]))
+    m3.metric("Em Andamento",  len(df[df["status"].str.contains("andamento", case=False, na=False)]))
+    m4.metric("Resolvidas",    len(df[df["status"].str.contains("Resolvido", na=False)]))
     st.markdown("---")
 
-    # ---- Filtros inline ----
     TODOS_STATUS = ["Todos", "🔴 Pendente", "🟡 Em andamento", "🟢 Resolvido"]
-    filtro_status_radio = st.radio(
-        "Status", TODOS_STATUS, horizontal=True, index=0
-    )
+    filtro_status_radio = st.radio("Status", TODOS_STATUS, horizontal=True, index=0)
 
     with st.expander("🔧 Filtros avançados"):
         filtro_classe = st.multiselect(
@@ -633,24 +497,19 @@ elif modo == "🔐 Administrador":
             default=sorted(df["classe"].unique().tolist()),
         )
 
-    if filtro_status_radio == "Todos":
-        filtro_status = df["status"].unique().tolist()
-    else:
-        filtro_status = [filtro_status_radio]
-
+    filtro_status = df["status"].unique().tolist() if filtro_status_radio == "Todos" else [filtro_status_radio]
     df_f = df[df["classe"].isin(filtro_classe) & df["status"].isin(filtro_status)].copy()
 
-    # Cores por status para o mapa (RGB)
     COR_STATUS = {
-        "🔴 Pendente":      [220, 38,  38],   # vermelho
-        "🟡 Em andamento":  [234, 179, 8],    # amarelo
-        "🟢 Resolvido":     [34,  197, 94],   # verde
+        "🔴 Pendente":     [220, 38,  38],
+        "🟡 Em andamento": [234, 179, 8],
+        "🟢 Resolvido":    [34,  197, 94],
     }
 
+    # ----------------------------------------------------------
     if pagina == "📍 Mapa":
         st.subheader("📍 Mapa de Ocorrências")
 
-        # Legenda de cores
         col_leg = st.columns(3)
         for i, (status, cor) in enumerate(COR_STATUS.items()):
             hex_cor = "#{:02x}{:02x}{:02x}".format(*cor)
@@ -660,12 +519,6 @@ elif modo == "🔐 Administrador":
                 unsafe_allow_html=True
             )
         st.markdown("")
-
-        # Usa lat/lon salvo no banco; geocodifica só se estiver faltando
-        def garantir_coords(row):
-            if pd.notna(row.get("lat")) and pd.notna(row.get("lon")):
-                return row["lat"], row["lon"]
-            return geocodificar(row["endereco"])
 
         if "lat" not in df_f.columns: df_f["lat"] = None
         if "lon" not in df_f.columns: df_f["lon"] = None
@@ -678,11 +531,11 @@ elif modo == "🔐 Administrador":
                     df_f.at[idx, "lat"] = lat
                     df_f.at[idx, "lon"] = lon
 
-        df_mapa = df_f.dropna(subset=["lat","lon"]).copy()
+        df_mapa = df_f.dropna(subset=["lat", "lon"]).copy()
 
         if not df_mapa.empty:
             import pydeck as pdk
-            df_mapa["cor"] = df_mapa["status"].map(lambda s: COR_STATUS.get(s, [100, 100, 100]))
+            df_mapa["cor"]     = df_mapa["status"].map(lambda s: COR_STATUS.get(s, [100, 100, 100]))
             df_mapa["tooltip"] = df_mapa.apply(
                 lambda r: r["classe"] + " — " + r["status"] + "\n" + r["endereco"], axis=1
             )
@@ -694,9 +547,7 @@ elif modo == "🔐 Administrador":
                 get_radius=60,
                 pickable=True,
             )
-            view = pdk.ViewState(
-                latitude=CRICIUMIA_LAT, longitude=CRICIUMIA_LON, zoom=13
-            )
+            view = pdk.ViewState(latitude=CRICIUMIA_LAT, longitude=CRICIUMIA_LON, zoom=13)
             st.pydeck_chart(pdk.Deck(
                 layers=[layer],
                 initial_view_state=view,
@@ -704,39 +555,61 @@ elif modo == "🔐 Administrador":
                 map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
             ))
             st.caption(f"✅ {len(df_mapa)} de {len(df_f)} endereços no mapa.")
-            st.dataframe(df_mapa[["id","classe","status","endereco","data"]].reset_index(drop=True), use_container_width=True)
+            st.dataframe(
+                df_mapa[["id", "classe", "status", "endereco", "data"]].reset_index(drop=True),
+                use_container_width=True
+            )
         else:
             st.warning("Nenhum endereço geolocalizado para os filtros selecionados.")
 
+    # ----------------------------------------------------------
     elif pagina == "📋 Demandas":
         st.subheader(f"📋 Demandas ({len(df_f)} encontradas)")
+
         for _, row in df_f.iterrows():
-            icon = "🔴" if "Pendente" in str(row.get("status","")) else "🟡" if "andamento" in str(row.get("status","")).lower() else "🟢"
-            classe_cid    = row.get("classe", "—") or "—"
-            classe_gpt    = row.get("classe_ia", "—") or "—"
+            s = str(row.get("status", ""))
+            icon = "🔴" if "Pendente" in s else "🟡" if "andamento" in s.lower() else "🟢"
+
+            classe_cid    = row.get("classe",        "—") or "—"
+            classe_gpt    = row.get("classe_ia",     "—") or "—"
             classe_gemini = row.get("classe_gemini", "—") or "—"
+            classe_yolo_v = row.get("classe_yolo",   "—") or "—"
+
             header = (
                 f"{icon} #{row['id']} — "
-                f"👤 {classe_cid} | GPT: {classe_gpt} | Gemini: {classe_gemini} | "
+                f"👤 {classe_cid} | GPT: {classe_gpt} | "
+                f"Gemini: {classe_gemini} | YOLO: {classe_yolo_v} | "
                 f"{row.get('status','')} | {row.get('data','')}"
             )
+
             with st.expander(header):
                 col_info, col_midia = st.columns([2, 1])
                 with col_info:
                     st.write(f"**📌 Endereço:** {row.get('endereco','')}")
                     st.write(f"**📝 Descrição:** {row.get('descricao','') or '—'}")
-                    # Classificações comparativas
-                    cc1, cc2, cc3 = st.columns(3)
+
+                    # Quatro colunas de classificação
+                    cc1, cc2, cc3, cc4 = st.columns(4)
                     with cc1:
                         st.info(f"**👤 Cidadão**\n{classe_cid}")
                     with cc2:
-                        fn = st.success if classe_gpt == classe_cid else (st.warning if classe_gpt.startswith("Erro") else st.info)
+                        fn = st.success if classe_gpt == classe_cid else (st.warning if "Erro" in classe_gpt else st.info)
                         fn(f"**🤖 GPT**\n{classe_gpt}")
                     with cc3:
-                        fn = st.success if classe_gemini == classe_cid else (st.warning if classe_gemini.startswith("Erro") else st.info)
+                        fn = st.success if classe_gemini == classe_cid else (st.warning if "Erro" in classe_gemini else st.info)
                         fn(f"**✨ Gemini**\n{classe_gemini}")
+                    with cc4:
+                        # YOLO: verde se detectou buraco E cidadão disse buraco, cinza se "—"
+                        if classe_yolo_v == "—":
+                            st.info(f"**🔍 YOLO**\n{classe_yolo_v}")
+                        elif "Buraco" in classe_yolo_v:
+                            fn = st.success if classe_cid == "Buraco" else st.warning
+                            fn(f"**🔍 YOLO**\n{classe_yolo_v}")
+                        else:
+                            st.info(f"**🔍 YOLO**\n{classe_yolo_v}")
+
                 with col_midia:
-                    url = row.get("url_arquivo"); tipo = str(row.get("tipo_arquivo",""))
+                    url = row.get("url_arquivo"); tipo = str(row.get("tipo_arquivo", ""))
                     if url:
                         if tipo.startswith("image/"): st.image(url)
                         elif tipo.startswith("video/"): st.video(url)
@@ -752,11 +625,12 @@ elif modo == "🔐 Administrador":
                 with c1:
                     novo_status = st.selectbox("Status", opcoes_status, index=idx_s, key=f"st_{row['id']}")
                 with c2:
-                    nova_resp = st.text_input("Resposta da Prefeitura", value=row.get("resposta",""), key=f"rp_{row['id']}")
+                    nova_resp = st.text_input(
+                        "Resposta da Prefeitura", value=row.get("resposta", ""), key=f"rp_{row['id']}"
+                    )
 
-                # Anexo já enviado pelo admin
                 resp_url_atual  = row.get("resp_url_arquivo")
-                resp_tipo_atual = str(row.get("resp_tipo_arquivo",""))
+                resp_tipo_atual = str(row.get("resp_tipo_arquivo", ""))
                 if resp_url_atual:
                     st.caption("📎 Mídia já anexada à resposta:")
                     if resp_tipo_atual.startswith("image/"): st.image(resp_url_atual)
@@ -765,7 +639,7 @@ elif modo == "🔐 Administrador":
 
                 novo_arquivo_resp = st.file_uploader(
                     "📎 Anexar foto/vídeo à resposta (opcional)",
-                    type=["png","jpg","jpeg","webp","mp4","mov"],
+                    type=["png", "jpg", "jpeg", "webp", "mp4", "mov"],
                     key=f"fu_{row['id']}"
                 )
 
@@ -775,13 +649,16 @@ elif modo == "🔐 Administrador":
                         ext  = novo_arquivo_resp.name.split(".")[-1]
                         nome = f"resp_{uuid.uuid4()}.{ext}"
                         novo_arquivo_resp.seek(0)
-                        supabase.storage.from_("anexos").upload(nome, novo_arquivo_resp.read(), {"content-type": novo_arquivo_resp.type})
+                        supabase.storage.from_("anexos").upload(
+                            nome, novo_arquivo_resp.read(), {"content-type": novo_arquivo_resp.type}
+                        )
                         update_data["resp_url_arquivo"]  = supabase.storage.from_("anexos").get_public_url(nome)
                         update_data["resp_tipo_arquivo"] = novo_arquivo_resp.type
                     supabase.table("solicitacoes").update(update_data).eq("id", row["id"]).execute()
                     st.success("✅ Atualizado!")
                     st.rerun()
 
+    # ----------------------------------------------------------
     elif pagina == "📊 Análise":
         st.subheader("📊 Análise Geral")
         g1, g2 = st.columns(2)
@@ -790,4 +667,7 @@ elif modo == "🔐 Administrador":
         with g2:
             st.write("**Por Status**"); st.bar_chart(df["status"].value_counts())
         st.markdown("---")
-        st.dataframe(df[["id","data","classe","status","endereco","descricao"]], use_container_width=True)
+        st.dataframe(
+            df[["id", "data", "classe", "status", "endereco", "descricao"]],
+            use_container_width=True
+        )
