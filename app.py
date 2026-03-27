@@ -26,14 +26,14 @@ st.set_page_config(
 # ==============================================================
 # CONEXÃO COM SUPABASE
 # ==============================================================
-@st.cache_resource
-def get_supabase() -> Client:
-    url = st.secrets["supabase"]["url"]
-    key = st.secrets["supabase"]["key"]
-    return create_client(url, key)
+# SUBSTITUI por isso:
+if "supabase" not in st.session_state:
+    st.session_state["supabase"] = create_client(
+        st.secrets["supabase"]["url"],
+        st.secrets["supabase"]["key"]
+    )
 
-supabase = get_supabase()
-
+supabase = st.session_state["supabase"]
 # ==============================================================
 # SESSÃO E LOGIN
 # ==============================================================
