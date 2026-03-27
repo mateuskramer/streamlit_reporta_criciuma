@@ -81,16 +81,16 @@ def tela_login(supabase: Client):
             senha = st.text_input("Senha", type="password", placeholder="••••••••")
             entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
 
-        if entrar:
-            if not email or not senha:
-                st.warning("Preencha email e senha.")
-            else:
-                with st.spinner("Autenticando..."):
-                    erro = fazer_login(supabase, email, senha)
-                if erro:
-                    st.error(erro)
+            if entrar:
+                if not email or not senha:
+                    st.warning("Preencha email e senha.")
                 else:
-                    st.rerun()
+                    with st.spinner("Autenticando..."):
+                        erro = fazer_login(supabase, email, senha)
+                    if erro:
+                        st.error(erro)
+                    else:
+                        st.rerun()
 
 
 def sidebar_usuario(supabase: Client):
