@@ -70,70 +70,28 @@ def detectar_buraco_yolo(arquivo=None, tipo_arquivo: str = "") -> dict | None:
             print(f"⚠️  YOLO API: {e}")
             return None
 
-    # ── VÍDEO ─────────────────────────────────────────────────
     if tipo.startswith("video/"):
-        tmp_video = None
-        frames_tmp = []
         try:
-            # Sufixo correto baseado no nome do arquivo
+            arquivo.seek(0)
             ext = os.path.splitext(arquivo.name)[1].lower() if arquivo.name else ".mp4"
-            sufixo = ext if ext in TIPOS_VIDEO else ".mp4"
-
+            tipo_envio = TIPOS_VIDEO.get(ext, "video/mp4")
+            r = requests.post(
+                f"{_get_api_url()}/detect/video",
+                files={"file": (arquivo.name, arquivo.read(), tipo_envio)},
+                timeout=120,  # vídeo precisa de mais tempo
+            )
             arquivo.seek(0)
-            with tempfile.NamedTemporaryFile(suffix=sufixo, delete=False) as tmp:
-                tmp.write(arquivo.read())
-                tmp_video = tmp.name
-            arquivo.seek(0)
-
-            cap = cv2.VideoCapture(tmp_video)
-            if not cap.isOpened():
-                print("⚠️  YOLO API: não foi possível abrir o vídeo")
-                return None
-
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if total_frames < 5:
-                print(f"⚠️  YOLO API: vídeo muito curto ({total_frames} frames)")
-                return None
-
-            # Posições: 10%, 30%, 50%, 70%, 90% do vídeo
-            posicoes = [int(total_frames * p) for p in [0.10, 0.30, 0.50, 0.70, 0.90]]
-
-            resultados = []
-            for pos in posicoes:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
-                ret, frame = cap.read()
-                if not ret:
-                    continue
-
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_img:
-                    cv2.imwrite(tmp_img.name, frame)
-                    frames_tmp.append(tmp_img.name)
-
-                resultado = _detectar_em_imagem(tmp_img.name)
-                if resultado and resultado.get("detectou_buraco"):
-                    resultados.append(resultado)
-
-            cap.release()
-
-            if not resultados:
-                return {"detectou_buraco": False, "confianca": 0.0, "n_deteccoes": 0,
-                        "mensagem": "Nenhum buraco detectado nos frames analisados."}
-
-            # Retorna o resultado com maior confiança
-            return max(resultados, key=lambda x: x.get("confianca", 0))
-
-        except Exception as e:
-            print(f"⚠️  YOLO API (vídeo): {e}")
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.Timeout:
+            print("⚠️  YOLO API: timeout (vídeo)")
             return None
-        finally:
-            if tmp_video and os.path.exists(tmp_video):
-                os.unlink(tmp_video)
-            for f in frames_tmp:
-                if os.path.exists(f):
-                    os.unlink(f)
-
-    return None  # áudio — sem detecção visual
-
+        except requests.exceptions.ConnectionError:
+            print("⚠️  YOLO API: sem conexão")
+            return None
+        except Exception as e:
+            print(f"⚠️  YOLO API: {e}")
+            return None
 
 def classe_yolo(resultado: dict | None) -> str:
     """
