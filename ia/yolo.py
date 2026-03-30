@@ -14,6 +14,23 @@ def _get_api_url() -> str:
         return _FALLBACK_URL
 
 
+for pos in posicoes:
+    cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+    ret, frame = cap.read()
+    if not ret:
+        st.write(f"Frame {pos}: falhou leitura")
+        continue
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_img:
+        cv2.imwrite(tmp_img.name, frame)
+        frames_tmp.append(tmp_img.name)
+
+    st.write(f"Frame {pos}: extraído, enviando para API...")
+    resultado = _detectar_em_imagem(tmp_img.name)
+    st.write(f"Frame {pos}: resultado = {resultado}")
+    if resultado and resultado.get("detectou_buraco"):
+        resultados.append(resultado)
+
 def _detectar_em_imagem(caminho_imagem: str) -> dict | None:
     """Envia um arquivo de imagem local para o endpoint /detect/image."""
     try:
@@ -28,6 +45,7 @@ def _detectar_em_imagem(caminho_imagem: str) -> dict | None:
     except Exception as e:
         print(f"⚠️  YOLO API (frame): {e}")
         return None
+
 
 
 def detectar_buraco_yolo(arquivo=None, tipo_arquivo: str = "") -> dict | None:
