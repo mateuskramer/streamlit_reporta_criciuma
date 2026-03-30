@@ -4,3 +4,4 @@ pandas
 requests
 pydeck
 openai
+opencv-python-headless
