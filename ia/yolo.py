@@ -64,6 +64,12 @@ def detectar_buraco_yolo(arquivo=None, tipo_arquivo: str = "") -> dict | None:
     if tipo.startswith("image/"):
         try:
             arquivo.seek(0)
+            tipo_envio = tipo if tipo.startswith("video/") else "video/mp4"
+            r = requests.post(
+                endpoint,
+                files={"file": (arquivo.name, arquivo.read(), tipo_envio)},
+                timeout=60,
+            )
             r = requests.post(
                 f"{_get_api_url()}/detect/image",
                 files={"file": (arquivo.name, arquivo.read(), tipo)},
