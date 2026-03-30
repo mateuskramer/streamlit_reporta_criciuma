@@ -1,8 +1,9 @@
+import os
+import cv2
+import tempfile
 import requests
 import streamlit as st
 
-# URL da API YOLO — configure em st.secrets["yolo"]["api_url"]
-# ou defina diretamente aqui para testes locais.
 _FALLBACK_URL = "http://localhost:8000"
 
 
@@ -13,74 +14,123 @@ def _get_api_url() -> str:
         return _FALLBACK_URL
 
 
+def _detectar_em_imagem(caminho_imagem: str) -> dict | None:
+    """Envia um arquivo de imagem local para o endpoint /detect/image."""
+    try:
+        with open(caminho_imagem, "rb") as f:
+            r = requests.post(
+                f"{_get_api_url()}/detect/image",
+                files={"file": ("frame.jpg", f, "image/jpeg")},
+                timeout=30,
+            )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"⚠️  YOLO API (frame): {e}")
+        return None
+
+
 def detectar_buraco_yolo(arquivo=None, tipo_arquivo: str = "") -> dict | None:
     """
-    Envia imagem ou vídeo para a YOLO API e retorna o resultado bruto.
-
-    Retorno em caso de sucesso (imagem):
-        {
-            "detectou_buraco": bool,
-            "confianca": float,       # 0.0 – 1.0
-            "n_deteccoes": int,
-            "mensagem": str
-        }
-
-    Retorno em caso de sucesso (vídeo):
-        {
-            "detectou_buraco": bool,
-            "confianca": float,
-            "n_frames_analisados": int,
-            "n_frames_com_buraco": int,
-            "mensagem": str
-        }
-
-    Retorna None se:
-      - arquivo for None
-      - tipo_arquivo for áudio (sem detecção visual)
-      - API estiver indisponível (falha silenciosa — não quebra o fluxo)
+    Para imagem: envia direto para /detect/image.
+    Para vídeo: extrai 5 frames distribuídos (10%, 30%, 50%, 70%, 90%)
+                e retorna o resultado com maior confiança.
+    Retorna None se arquivo for None, tipo for áudio, ou API indisponível.
     """
     if arquivo is None:
         return None
 
     tipo = tipo_arquivo or ""
 
+    # ── IMAGEM ────────────────────────────────────────────────
     if tipo.startswith("image/"):
-        endpoint = f"{_get_api_url()}/detect/image"
-    elif tipo.startswith("video/"):
-        endpoint = f"{_get_api_url()}/detect/video"
-    else:
-        return None  # áudio não tem detecção visual
+        try:
+            arquivo.seek(0)
+            r = requests.post(
+                f"{_get_api_url()}/detect/image",
+                files={"file": (arquivo.name, arquivo.read(), tipo)},
+                timeout=30,
+            )
+            arquivo.seek(0)
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.Timeout:
+            print("⚠️  YOLO API: timeout (imagem)")
+            return None
+        except requests.exceptions.ConnectionError:
+            print("⚠️  YOLO API: sem conexão")
+            return None
+        except Exception as e:
+            print(f"⚠️  YOLO API: {e}")
+            return None
 
-    try:
-        arquivo.seek(0)
-        r = requests.post(
-            endpoint,
-            files={"file": (arquivo.name, arquivo.read(), tipo)},
-            timeout=60,  # vídeo pode levar mais tempo
-        )
-        arquivo.seek(0)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.Timeout:
-        print("⚠️  YOLO API: timeout")
-        return None
-    except requests.exceptions.ConnectionError:
-        print("⚠️  YOLO API: sem conexão")
-        return None
-    except Exception as e:
-        print(f"⚠️  YOLO API: {e}")
-        return None
+    # ── VÍDEO ─────────────────────────────────────────────────
+    if tipo.startswith("video/"):
+        tmp_video = None
+        frames_tmp = []
+        try:
+            # Salva o vídeo em arquivo temporário
+            arquivo.seek(0)
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                tmp.write(arquivo.read())
+                tmp_video = tmp.name
+            arquivo.seek(0)
+
+            cap = cv2.VideoCapture(tmp_video)
+            if not cap.isOpened():
+                return None
+
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames < 5:
+                return None
+
+            # Posições: 10%, 30%, 50%, 70%, 90% do vídeo
+            posicoes = [int(total_frames * p) for p in [0.10, 0.30, 0.50, 0.70, 0.90]]
+
+            resultados = []
+            for pos in posicoes:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+
+                # Salva frame como JPEG temporário
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_img:
+                    cv2.imwrite(tmp_img.name, frame)
+                    frames_tmp.append(tmp_img.name)
+
+                resultado = _detectar_em_imagem(tmp_img.name)
+                if resultado and resultado.get("detectou_buraco"):
+                    resultados.append(resultado)
+
+            cap.release()
+
+            if not resultados:
+                # Nenhum frame detectou — retorna "não detectado"
+                return {"detectou_buraco": False, "confianca": 0.0, "n_deteccoes": 0,
+                        "mensagem": "Nenhum buraco detectado nos frames analisados."}
+
+            # Retorna o resultado com maior confiança
+            return max(resultados, key=lambda x: x.get("confianca", 0))
+
+        except Exception as e:
+            print(f"⚠️  YOLO API (vídeo): {e}")
+            return None
+        finally:
+            # Limpa arquivos temporários
+            if tmp_video and os.path.exists(tmp_video):
+                os.unlink(tmp_video)
+            for f in frames_tmp:
+                if os.path.exists(f):
+                    os.unlink(f)
+
+    return None  # áudio — sem detecção visual
 
 
 def classe_yolo(resultado: dict | None) -> str:
     """
-    Converte o resultado bruto da YOLO API em uma string de classe,
+    Converte o resultado da YOLO API em string de classe,
     no mesmo formato que classificar_gpt() e classificar_gemini().
-
-    Exemplos de retorno:
-      "Buraco (87%)"   — detectou com confiança
-      "Não detectado"  — API respondeu mas não achou buraco
-      "—"              — API indisponível ou arquivo não suportado
     """
     if resultado is None:
         return "—"
