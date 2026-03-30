@@ -6,6 +6,12 @@ import streamlit as st
 
 _FALLBACK_URL = "http://localhost:8000"
 
+TIPOS_VIDEO = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+}
+
 
 def _get_api_url() -> str:
     try:
@@ -13,23 +19,6 @@ def _get_api_url() -> str:
     except Exception:
         return _FALLBACK_URL
 
-
-for pos in posicoes:
-    cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
-    ret, frame = cap.read()
-    if not ret:
-        st.write(f"Frame {pos}: falhou leitura")
-        continue
-
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_img:
-        cv2.imwrite(tmp_img.name, frame)
-        frames_tmp.append(tmp_img.name)
-
-    st.write(f"Frame {pos}: extraído, enviando para API...")
-    resultado = _detectar_em_imagem(tmp_img.name)
-    st.write(f"Frame {pos}: resultado = {resultado}")
-    if resultado and resultado.get("detectou_buraco"):
-        resultados.append(resultado)
 
 def _detectar_em_imagem(caminho_imagem: str) -> dict | None:
     """Envia um arquivo de imagem local para o endpoint /detect/image."""
@@ -45,7 +34,6 @@ def _detectar_em_imagem(caminho_imagem: str) -> dict | None:
     except Exception as e:
         print(f"⚠️  YOLO API (frame): {e}")
         return None
-
 
 
 def detectar_buraco_yolo(arquivo=None, tipo_arquivo: str = "") -> dict | None:
@@ -64,12 +52,6 @@ def detectar_buraco_yolo(arquivo=None, tipo_arquivo: str = "") -> dict | None:
     if tipo.startswith("image/"):
         try:
             arquivo.seek(0)
-            tipo_envio = tipo if tipo.startswith("video/") else "video/mp4"
-            r = requests.post(
-                endpoint,
-                files={"file": (arquivo.name, arquivo.read(), tipo_envio)},
-                timeout=60,
-            )
             r = requests.post(
                 f"{_get_api_url()}/detect/image",
                 files={"file": (arquivo.name, arquivo.read(), tipo)},
@@ -93,19 +75,24 @@ def detectar_buraco_yolo(arquivo=None, tipo_arquivo: str = "") -> dict | None:
         tmp_video = None
         frames_tmp = []
         try:
-            # Salva o vídeo em arquivo temporário
+            # Sufixo correto baseado no nome do arquivo
+            ext = os.path.splitext(arquivo.name)[1].lower() if arquivo.name else ".mp4"
+            sufixo = ext if ext in TIPOS_VIDEO else ".mp4"
+
             arquivo.seek(0)
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            with tempfile.NamedTemporaryFile(suffix=sufixo, delete=False) as tmp:
                 tmp.write(arquivo.read())
                 tmp_video = tmp.name
             arquivo.seek(0)
 
             cap = cv2.VideoCapture(tmp_video)
             if not cap.isOpened():
+                print("⚠️  YOLO API: não foi possível abrir o vídeo")
                 return None
 
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if total_frames < 5:
+                print(f"⚠️  YOLO API: vídeo muito curto ({total_frames} frames)")
                 return None
 
             # Posições: 10%, 30%, 50%, 70%, 90% do vídeo
@@ -118,7 +105,6 @@ def detectar_buraco_yolo(arquivo=None, tipo_arquivo: str = "") -> dict | None:
                 if not ret:
                     continue
 
-                # Salva frame como JPEG temporário
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_img:
                     cv2.imwrite(tmp_img.name, frame)
                     frames_tmp.append(tmp_img.name)
@@ -130,7 +116,6 @@ def detectar_buraco_yolo(arquivo=None, tipo_arquivo: str = "") -> dict | None:
             cap.release()
 
             if not resultados:
-                # Nenhum frame detectou — retorna "não detectado"
                 return {"detectou_buraco": False, "confianca": 0.0, "n_deteccoes": 0,
                         "mensagem": "Nenhum buraco detectado nos frames analisados."}
 
@@ -141,7 +126,6 @@ def detectar_buraco_yolo(arquivo=None, tipo_arquivo: str = "") -> dict | None:
             print(f"⚠️  YOLO API (vídeo): {e}")
             return None
         finally:
-            # Limpa arquivos temporários
             if tmp_video and os.path.exists(tmp_video):
                 os.unlink(tmp_video)
             for f in frames_tmp:
